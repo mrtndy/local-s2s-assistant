@@ -1,4 +1,4 @@
-# Local Speech to Speech Assistant on Windows 11 (RTX 4070 8 GB)
+# Local Speech to Speech Assistant
 
 ASR: faster-whisper on CUDA  
 LLM: Ollama `qwen2.5:7b-instruct`  
