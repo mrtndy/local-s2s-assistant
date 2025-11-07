@@ -15,8 +15,8 @@ The entire loop runs without cloud services, ensuring privacy and low latency.
 
 * **Ollama**: You must have [Ollama](https://ollama.com/) installed and running.
 * **Python**: Python 3.10+
-* **NVIDIA GPU** (Recommended): Required for `faster-whisper` to run efficiently on CUDA.
-* **FFmpeg**: (Optional, but recommended) A system-wide install of FFmpeg is often needed for audio libraries.
+* **NVIDIA GPU**: Required for `faster-whisper` to run efficiently on CUDA.
+* **FFmpeg**: A system-wide install of FFmpeg is needed for audio libraries.
 
 ### 2. Installation
 
