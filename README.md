@@ -38,19 +38,19 @@ A fully local speech to speech assistant.
 You speak. The system transcribes with Whisper, gets a reply from a local LLM through Ollama, then speaks the answer with Piper. Recording stops on silence. The script prints per stage timings so you can see where latency lives.
 
 **Why this setup**  
-- Works fully offline.  
-- Fits in 8 GB VRAM using `int8_float16` compute type.  
-- Modular scripts let you swap components later.
+* Works fully offline.  
+* Fits in 8 GB VRAM using `int8_float16` compute type.  
+* Modular scripts let you swap components later.
 
 ---
 
 ## 2) System requirements
 
-- Windows 11  
-- NVIDIA RTX 4070 laptop GPU with recent driver  
-- Python 3.11 to 3.13  
-- PowerShell  
-- Internet for first time model downloads
+* Windows 11  
+* NVIDIA RTX 4070 laptop GPU with recent driver  
+* Python 3.11 to 3.13  
+* PowerShell  
+* Internet for first time model downloads
 
 ---
 
@@ -59,8 +59,19 @@ You speak. The system transcribes with Whisper, gets a reply from a local LLM th
 ```powershell
 # Install FFmpeg
 winget install --id=Gyan.FFmpeg -e
+
+# Persist FFmpeg to your user PATH, then open a NEW terminal
 $ff = Get-ChildItem "$env:LOCALAPPDATA\Microsoft\WinGet\Packages" -Recurse -Filter ffmpeg.exe | Select-Object -First 1
-$env:Path = "$($ff.DirectoryName);$env:Path"
+if ($ff) {
+  $new = "$($ff.DirectoryName);" + [Environment]::GetEnvironmentVariable("Path","User")
+  [Environment]::SetEnvironmentVariable("Path", $new, "User")
+  Write-Host "Added to PATH:" $ff.DirectoryName
+} else {
+  Write-Host "ffmpeg.exe not found under WinGet packages."
+}
+
+# Verify in a NEW terminal
+ffmpeg -version
 
 # Install Ollama and pull model
 winget install Ollama.Ollama
