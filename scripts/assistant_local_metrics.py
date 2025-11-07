@@ -1,197 +1,190 @@
-import time
-import sys
-import requests
+import os, sys, re, time, json, queue, threading, tempfile, shutil, subprocess
+from pathlib import Path
 import numpy as np
 import sounddevice as sd
+import soundfile as sf
+import requests, webrtcvad
 from faster_whisper import WhisperModel
-from piper.voice import PiperVoice
 
-# ---------- config ----------
-SAMPLE_RATE = 16000
+# --- Config ---
+OLLAMA_URL   = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:3b-instruct")
+WHISPER_MODEL= os.getenv("WHISPER_MODEL", "large-v3")
 
-ASR_MODEL   = "base.en"       # bump to "small.en" or "medium.en" later if desired
-ASR_DEVICE  = "cuda"
-ASR_COMPUTE = "int8_float16"
+# VAD Settings (Tuned for accuracy)
+SAMPLE_RATE      = 16000
+VAD_FRAME_MS     = 30 
+VAD_AGGRESSIVENESS = 1     # 0=Most Permissive, 3=Most Aggressive. 1 is a good balance.
+SILENCE_LIMIT_MS = 1000    # Wait 1s of silence before assuming user is done
+MAX_REC_SEC      = 30
 
-OLLAMA_URL  = "http://127.0.0.1:11434"
-LLM_MODEL   = "qwen2.5:7b-instruct"
-NUM_CTX     = 2048
-TEMP        = 0.3
+VOICE_ONNX = Path("voices/en_US-amy-low.onnx")
+VOICE_CFG  = Path("voices/en_US-amy-low.onnx.json")
 
-VOICE_ONNX  = r".\voices\en_US-amy-low.onnx"
-VOICE_JSON  = r".\voices\en_US-amy-low.onnx.json"
-# ----------------------------
+def log(x): print(x, flush=True)
 
-# ----- timing helpers -----
-T0 = time.perf_counter()
+# --- VAD Recorder ---
+class VADRecorder:
+    def __init__(self):
+        self.vad = webrtcvad.Vad(VAD_AGGRESSIVENESS)
+        self.frame_len = int(SAMPLE_RATE * VAD_FRAME_MS / 1000)
+        self.q = queue.Queue()
 
-def now_ts():
-    t = time.time()
-    lt = time.localtime(t)
-    ms = int((t - int(t)) * 1000)
-    return time.strftime("%H:%M:%S", lt) + f".{ms:03d}"
+    def record(self):
+        stream = sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="float32",
+                                blocksize=self.frame_len, callback=self._cb)
+        frames = []; active = False; silence_ms = 0; t0 = time.perf_counter()
+        log("\n[Recording] Speak now...")
+        with stream:
+            while True:
+                try: chunk = self.q.get(timeout=1.0)
+                except queue.Empty:
+                    if time.perf_counter() - t0 > MAX_REC_SEC: break
+                    continue
+                
+                # WebRTC VAD requires 16-bit PCM
+                pcm16 = (np.clip(chunk, -1, 1) * 32767).astype(np.int16).tobytes()
+                if len(pcm16) != self.frame_len * 2: continue 
 
-def since_start_ms():
-    return int(round((time.perf_counter() - T0) * 1000))
+                if self.vad.is_speech(pcm16, SAMPLE_RATE):
+                    if not active: log(" > Voice detected")
+                    active = True; silence_ms = 0
+                elif active:
+                    silence_ms += VAD_FRAME_MS
+                    
+                if active: frames.append(chunk)
+                if active and silence_ms >= SILENCE_LIMIT_MS:
+                    log(" > Silence detected, finishing."); break
+                if time.perf_counter() - t0 > MAX_REC_SEC:
+                     log(" > Max time reached."); break
 
-def log(msg):
-    print(f"[{now_ts()} +{since_start_ms()}ms] {msg}")
+        return np.concatenate(frames) if frames else np.array([], dtype=np.float32)
 
-def ms(seconds: float) -> int:
-    return int(round(seconds * 1000))
-# --------------------------
+    def _cb(self, indata, f, t, s): self.q.put(indata[:, 0].copy())
 
-def record_until_silence(rate=SAMPLE_RATE, frame_ms=20, warmup_ms=120, silence_ms=700, max_ms=7000):
-    """RMS-based VAD: stop ~silence_ms after speech ends."""
-    frame_len = int(rate * frame_ms / 1000)
-    warmup_frames = max(1, warmup_ms // frame_ms)
-    silence_frames = max(1, silence_ms // frame_ms)
-    max_frames = max(1, max_ms // frame_ms)
+# --- Helpers ---
+def normalize_audio(audio, target_db=-3.0):
+    """Normalizes audio to a target dB level to help Whisper hear quiet mics."""
+    peak = np.max(np.abs(audio))
+    if peak == 0: return audio
+    target_linear = 10 ** (target_db / 20)
+    return audio * (target_linear / peak)
 
-    def rms(x: np.ndarray) -> float:
-        return float(np.sqrt(np.mean(x * x) + 1e-12))
+def stream_llm(text):
+    """Streams reply from Ollama, yielding chunks of text."""
+    prompt = f"You are a concise assistant. Reply in under 50 words.\nUser: {text}\nAssistant:"
+    try:
+        with requests.post(f"{OLLAMA_URL}/api/generate", stream=True, timeout=30,
+                           json={"model": OLLAMA_MODEL, "prompt": prompt, "stream": True}) as r:
+            for line in r.iter_lines():
+                if not line: continue
+                j = json.loads(line)
+                if j.get("done"): break
+                yield j.get("response", "")
+    except Exception as e: log(f"\nLLM Error: {e}")
 
-    buf = []
-    noise_window = []
-    silence_count = 0
-    speech_started = False
-    threshold = None
+# --- Robust TTS ---
+class TTS:
+    def __init__(self):
+        if not VOICE_ONNX.exists(): raise FileNotFoundError(f"Missing {VOICE_ONNX}")
+        self.q = queue.Queue()
+        self.thread = threading.Thread(target=self._loop, daemon=True)
+        self.thread.start()
 
-    log("Listening… speak, then pause to end.")
-    with sd.InputStream(samplerate=rate, channels=1, dtype="float32", blocksize=frame_len) as stream:
-        for _ in range(max_frames):
-            frame, _ = stream.read(frame_len)
-            f = frame[:, 0]
+    def say(self, text): self.q.put(text)
 
-            if len(noise_window) < warmup_frames:
-                noise_window.append(rms(f))
-                buf.append(f.copy())
+    def _loop(self):
+        try:
+            from piper.voice import PiperVoice
+            # Load voice ONCE inside the thread
+            voice = PiperVoice.load(str(VOICE_ONNX), str(VOICE_CFG), use_cuda=False)
+            
+            stream = None
+            current_sr = None
+
+            while True:
+                text = self.q.get()
+                if text is None: break # Poison pill to exit
+
+                # Synthesize and stream audio chunks
+                for audio_chunk in voice.synthesize(text):
+                    sr = getattr(audio_chunk, "sample_rate", 22050)
+                    data = getattr(audio_chunk, "audio_int16_array", None)
+                    if data is None or len(data) == 0: continue
+
+                    # Ensure valid numpy array for sounddevice
+                    data_np = np.array(data, dtype=np.int16)
+
+                    # Open/Re-open stream if needed
+                    if stream is None or sr != current_sr:
+                        if stream: stream.stop(); stream.close()
+                        stream = sd.RawOutputStream(samplerate=sr, channels=1, dtype='int16')
+                        stream.start()
+                        current_sr = sr
+                    
+                    stream.write(data_np.tobytes())
+                
+                # Small pause between sentences feels more natural
+                sd.sleep(150)
+
+        except Exception as e:
+            # THIS WILL PRINT THE ACTUAL ERROR IF IT CRASHES AGAIN
+            print(f"\n!!! TTS THREAD CRASHED !!!\nError: {e}\n", file=sys.stderr)
+
+# --- Main Loop ---
+def main():
+    print("Loading Whisper...", end="", flush=True)
+    asr = WhisperModel(WHISPER_MODEL, device="cuda", compute_type="float16")
+    print(" Done.\nInitializing Audio...", flush=True)
+    vad = VADRecorder()
+    tts = TTS()
+    print("\n--- READY --- (Ctrl+C to quit)")
+
+    while True:
+        try:
+            input("[Press Enter] to start recording...")
+            audio = vad.record()
+            
+            if len(audio) < SAMPLE_RATE * 0.5:
+                print("(Ignoring short audio)")
                 continue
 
-            if threshold is None:
-                noise = np.median(noise_window)
-                threshold = max(noise * 4.0, 0.008)  # floor near -42 dBFS
+            # 1. Normalize audio before sending to Whisper
+            audio = normalize_audio(audio)
 
-            level = rms(f)
-            buf.append(f.copy())
+            # 2. Transcribe
+            segs, _ = asr.transcribe(audio, language="en", beam_size=5, 
+                                     vad_filter=True, suppress_tokens=[-1])
+            user_text = " ".join(s.text for s in segs).strip()
+            
+            print(f"\nUser: {user_text}")
+            if not user_text: continue
 
-            if level > threshold:
-                speech_started = True
-                silence_count = 0
-            else:
-                if speech_started:
-                    silence_count += 1
-                    if silence_count >= silence_frames:
-                        break
+            # 3. Stream LLM + TTS
+            print("Assistant: ", end="", flush=True)
+            buf = ""
+            for chunk in stream_llm(user_text):
+                print(chunk, end="", flush=True)
+                buf += chunk
+                # Split by sentence endings to stream TTS
+                if re.search(r"[\.\?\!\n]", chunk):
+                    # Find complete sentences in buffer
+                    parts = re.split(r'([\.\?\!\n]+)', buf)
+                    # Process pairs of (sentence, punctuation)
+                    for i in range(0, len(parts) - 1, 2):
+                        if i+1 < len(parts):
+                            sentence = parts[i] + parts[i+1]
+                            if sentence.strip(): tts.say(sentence.strip())
+                    # Keep the incomplete remaining part in buffer
+                    buf = parts[-1] if len(parts) % 2 == 1 else ""
+            
+            if buf.strip(): tts.say(buf.strip())
+            print("\n")
 
-    return np.concatenate(buf) if buf else np.zeros(0, dtype=np.float32)
-
-# ----- load ASR / TTS once -----
-log("[ASR] loading faster-whisper…")
-t0 = time.perf_counter()
-WHISPER = WhisperModel(ASR_MODEL, device=ASR_DEVICE, compute_type=ASR_COMPUTE)
-log(f"[METRIC] asr_load_ms={ms(time.perf_counter() - t0)}")
-
-log("[TTS] loading Piper voice…")
-t0 = time.perf_counter()
-VOICE = PiperVoice.load(model_path=VOICE_ONNX, config_path=VOICE_JSON, use_cuda=False)
-log(f"[METRIC] tts_load_ms={ms(time.perf_counter() - t0)}")
-
-def transcribe(samples: np.ndarray) -> str:
-    t0 = time.perf_counter()
-    segs, info = WHISPER.transcribe(samples, vad_filter=True, language="en")
-    text = " ".join(s.text for s in segs).strip()
-    t1 = time.perf_counter()
-    log(f"[ASR] lang={info.language}  text={text}")
-    log(f"[METRIC] asr_ms={ms(t1 - t0)}")
-    return text
-
-def chat_ollama(prompt: str) -> str:
-    payload = {
-        "model": LLM_MODEL,
-        "prompt": f"You are a brief voice assistant.\nUser: {prompt}\nAssistant:",
-        "stream": False,
-        "options": {"num_ctx": NUM_CTX, "temperature": TEMP},
-    }
-    t0 = time.perf_counter()
-    r = requests.post(f"{OLLAMA_URL}/api/generate", json=payload, timeout=300)
-    t1 = time.perf_counter()
-    r.raise_for_status()
-    j = r.json()
-    reply = j.get("response", "").strip()
-    eval_count = j.get("eval_count")
-    eval_dur_ns = j.get("eval_duration")
-    log(f"[LLM] {reply}")
-    if isinstance(eval_count, int) and isinstance(eval_dur_ns, int) and eval_dur_ns > 0:
-        tok_s = eval_count / (eval_dur_ns / 1e9)
-        log(f"[METRIC] llm_ms={ms(t1 - t0)}  llm_tokens={eval_count}  llm_tok_s={tok_s:.1f}")
-    else:
-        log(f"[METRIC] llm_ms={ms(t1 - t0)}")
-    return reply
-
-def tts_piper(text: str):
-    # Synthesize
-    t0 = time.perf_counter()
-    parts = []
-    sr = 22050
-    for ch in VOICE.synthesize(text):
-        try:
-            arr = np.asarray(ch.audio_int16_array, dtype=np.int16).reshape(-1)
-            if arr.size:
-                parts.append(arr)
-            if hasattr(ch, "sample_rate"):
-                sr = int(ch.sample_rate)
+        except KeyboardInterrupt:
+            print("\nExiting."); break
         except Exception as e:
-            log(f"[TTS] warn bad chunk: {e}")
-            continue
-    t1 = time.perf_counter()
-    synth_ms = ms(t1 - t0)
-
-    if not parts:
-        log("[TTS] no audio")
-        return
-
-    audio = np.concatenate(parts)
-    aud_sec = len(audio) / float(sr)
-
-    # Play
-    t2 = time.perf_counter()
-    sd.play(audio, sr)
-    sd.wait()
-    t3 = time.perf_counter()
-    play_ms = ms(t3 - t2)
-
-    rtf = (synth_ms / 1000.0) / max(aud_sec, 1e-6)
-    log(f"[METRIC] tts_synth_ms={synth_ms}  tts_play_ms={play_ms}  tts_audio_sec={aud_sec:.2f}  tts_rtf={rtf:.2f}")
-
-def main():
-    e0 = time.perf_counter()
-
-    # Record
-    r0 = time.perf_counter()
-    samples = record_until_silence()
-    r1 = time.perf_counter()
-    dur_sec = samples.size / SAMPLE_RATE
-    log(f"[METRIC] record_ms={ms(r1 - r0)}  captured_sec={dur_sec:.2f}")
-
-    if samples.size == 0:
-        log("[ASR] empty capture. Try again.")
-        sys.exit(0)
-
-    # ASR
-    text = transcribe(samples)
-    if not text:
-        log("[ASR] empty transcript. Try again.")
-        sys.exit(0)
-
-    # LLM
-    reply = chat_ollama(text)
-
-    # TTS
-    tts_piper(reply)
-
-    log(f"[METRIC] e2e_ms={ms(time.perf_counter() - e0)}")
-    log("[S2S] done")
+             print(f"\nMain Loop Error: {e}")
 
 if __name__ == "__main__":
     main()
